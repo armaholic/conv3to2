@@ -2,41 +2,48 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"regexp"
 	"runtime"
-	"strings"
-	//"time"
+	"sync"
+	"time"
 )
 
 var workers = runtime.NumCPU()
 
 func main() {
-	//start := time.Now()
+	start := time.Now()
 	runtime.GOMAXPROCS(workers)
 
 	fileSourse := flag.String("s", "mission.sqf", "SOURCE FILE")
 	fileDestination := flag.String("d", "local.sqf", "DESTINATION FILE")
 	flag.Parse()
 
-	bytes, err := ioutil.ReadFile(*fileSourse)
+	ioBytes, err := ioutil.ReadFile(*fileSourse)
 	if err != nil {
 		fmt.Println("Error opening file:", err)
 		os.Exit(1)
 	}
 
-	rx := regexp.MustCompile(`_vehicle_([\d]*) [^}]+};`)
-	//rx0 := regexp.MustCompile(`_vehicle_([\d]*) = objNull;`)
-	rx1 := regexp.MustCompile(`_this = createVehicle \["([A-Za-z0-9_]*)", \[[ -.,0-9e]*\], \[\], 0, "[A-Za-z0-9_]*"\];`)
-	rx2 := regexp.MustCompile(`_this setDir ([ -.,0-9e]*;)`)
-	rx3 := regexp.MustCompile(`_this setPos \[([ -.,0-9e]*)\];`)
-	rx4 := regexp.MustCompile(`_this setVehicleInit "this setVectorUp \[([ -.,0-9e]*)\];";`)
+	var (
+		wg         sync.WaitGroup
+		matcheChan = make(chan []byte)
+		rx0        = regexp.MustCompile(`_vehicle_[\d]* [^}]+};`)
+		rx1        = regexp.MustCompile(`_this = createVehicle \["([A-Za-z0-9_]*)", \[[ -.,0-9e]*\], \[\], 0, "[A-Za-z0-9_]*"\];`)
+		rx2        = regexp.MustCompile(`_this setDir ([ -.,0-9e]*;)`)
+		rx3        = regexp.MustCompile(`_this setPos \[([ -.,0-9e]*)\];`)
+		rx4        = regexp.MustCompile(`_this setVehicleInit "this setVectorUp \[([ -.,0-9e]*)\];";`)
+		rx1r       = []byte(`_this = "$1" createVehicleLocal [0,0,0]; `)
+		rx2r       = []byte(`_this setDir $1 `)
+		rx3r       = []byte(`_this setPos [$1]; `)
+		rx4r       = []byte(`_this setVectorUp [$1]; `)
+		dmg        = []byte("_this allowDamage false;\n")
+	)
 
-	matches := rx.FindAllString(string(bytes), -1)
+	matches := rx0.FindAll(ioBytes, -1)
 	if matches == nil {
 		fmt.Println("No fount matches")
 		os.Exit(1)
@@ -49,26 +56,50 @@ func main() {
 	}
 	defer file.Close()
 
-	for _, m := range matches {
-		s := bufio.NewScanner(strings.NewReader(m))
-		var line string
-		for s.Scan() {
-			if rx1.MatchString(s.Text()) == true {
-				line += strings.Trim((rx1.ReplaceAllString(s.Text(), `_this = "$1" createVehicleLocal [0,0,0];`)), " ") + "\n"
-			} else if rx2.MatchString(s.Text()) == true {
-				line += strings.Trim((rx2.ReplaceAllString(s.Text(), `_this setDir $1`)), " ") + "\n"
-			} else if rx3.MatchString(s.Text()) == true {
-				line += strings.Trim((rx3.ReplaceAllString(s.Text(), `_this setPos [$1];`)), " ") + "\n"
-			} else if rx4.MatchString(s.Text()) == true {
-				line += strings.Trim((rx4.ReplaceAllString(s.Text(), `_this setVectorUp [$1];`)), " ") + "\n"
+	for _, matche := range matches {
+		go func(matche []byte) {
+			wg.Add(1)
+			defer wg.Done()
+			var obj []byte
+
+			crt := rx1.ReplaceAll(rx1.Find(matche), rx1r)
+			dir := rx2.ReplaceAll(rx2.Find(matche), rx2r)
+			pos := rx2.ReplaceAll(rx3.Find(matche), rx3r)
+			vct := rx4.ReplaceAll(rx4.Find(matche), rx4r)
+
+			if crt != nil && dir != nil {
+				obj = append(crt, dir...)
+			} else if crt != nil && dir == nil {
+				obj = crt
 			}
-		}
-		if len(line) != 0 {
-			line += "_this allowDamage false;\n\n"
-		}
-		file.WriteString(line)
+			if pos != nil {
+				obj = append(obj, pos...)
+			}
+			if vct != nil {
+				obj = append(obj, vct...)
+			}
+			if obj != nil {
+				obj = append(obj, dmg...)
+			}
+
+			if obj != nil {
+				matcheChan <- obj
+			} else {
+				wg.Done()
+			}
+
+		}(matche)
 	}
 
-	//elapsed := time.Since(start)
-	//fmt.Printf("\nTime taken %s\n", elapsed)
+	go func() {
+		for data := range matcheChan {
+			file.Write(data)
+		}
+	}()
+
+	wg.Wait()
+
+	elapsed := time.Since(start)
+	fmt.Printf("\nTime taken %s\n", elapsed)
+
 }
